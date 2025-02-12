@@ -108,19 +108,4 @@ Example filters:
   }
   ```
 
-## Contributing
-
-We welcome contributions from the community. Please refer to the [CONTRIBUTING.md](CONTRIBUTING.md) file for guidelines on reporting issues, suggesting improvements, and submitting pull requests.
-
-## License
-
-This project is licensed under the [MIT License](LICENSE).
-
-## Additional Resources
-- [ReAG Blog Post](https://www.superagent.sh/blog/reag-reasoning-augmented-generation) - A deep dive into ReAG.
-
-## Contact
-
-For support or inquiries, please contact:
-- [Create Issue](https://github.com/superagent-ai/reag/issues)
-- X: [@superagent_ai](https://x.com/superagent_ai)
+#
