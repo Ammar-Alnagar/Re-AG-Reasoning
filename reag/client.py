@@ -8,6 +8,7 @@ from litellm import acompletion
 
 from reag.prompt import REAG_SYSTEM_PROMPT
 from reag.schema import ResponseSchemaMessage
+from reag.memory import Memory
 
 
 class Document(BaseModel):
@@ -32,6 +33,13 @@ class QueryResult(BaseModel):
     document: Document
 
 
+class StreamingQueryResult(BaseModel):
+    content: str
+    reasoning: Optional[str] = None
+    is_irrelevant: Optional[bool] = None
+    document: Optional[Document] = None
+
+
 DEFAULT_BATCH_SIZE = 20
 
 
@@ -43,12 +51,14 @@ class ReagClient:
         batch_size: int = DEFAULT_BATCH_SIZE,
         schema: Optional[BaseModel] = None,
         model_kwargs: Optional[Dict] = None,
+        memory: Optional[Memory] = None,
     ):
         self.model = model
         self.system = system or REAG_SYSTEM_PROMPT
         self.batch_size = batch_size
         self.schema = schema or ResponseSchemaMessage
         self.model_kwargs = model_kwargs or {}
+        self.memory = memory or Memory()
         self._http_client = None
 
     async def __aenter__(self):
@@ -65,69 +75,38 @@ class ReagClient:
         if not filters:
             return documents
 
-        filtered_docs = []
-        for doc in documents:
-            matches_all_filters = True
+        def passes_filter(doc: Document, f: MetadataFilter) -> bool:
+            if not doc.metadata or f.key not in doc.metadata:
+                return False
 
-            for filter_item in filters:
-                metadata_value = (
-                    doc.metadata.get(filter_item.key) if doc.metadata else None
-                )
-                if metadata_value is None:
-                    matches_all_filters = False
-                    break
+            val = doc.metadata[f.key]
+            op = f.operator or "equals"
 
-                if isinstance(metadata_value, str) and isinstance(
-                    filter_item.value, str
-                ):
-                    if filter_item.operator == "contains":
-                        if not filter_item.value in metadata_value:
-                            matches_all_filters = False
-                            break
-                    elif filter_item.operator == "startsWith":
-                        if not metadata_value.startswith(filter_item.value):
-                            matches_all_filters = False
-                            break
-                    elif filter_item.operator == "endsWith":
-                        if not metadata_value.endswith(filter_item.value):
-                            matches_all_filters = False
-                            break
-                    elif filter_item.operator == "regex":
-                        import re
+            if op == "equals":
+                return val == f.value
+            if op == "notEquals":
+                return val != f.value
+            if op == "contains":
+                return isinstance(val, str) and f.value in val
+            if op == "startsWith":
+                return isinstance(val, str) and val.startswith(f.value)
+            if op == "endsWith":
+                return isinstance(val, str) and val.endswith(f.value)
+            if op == "regex":
+                return isinstance(val, str) and re.match(f.value, val) is not None
+            if op == "greaterThan":
+                return val > f.value
+            if op == "lessThan":
+                return val < f.value
+            if op == "greaterThanOrEqual":
+                return val >= f.value
+            if op == "lessThanOrEqual":
+                return val <= f.value
+            return False
 
-                        if not re.match(filter_item.value, metadata_value):
-                            matches_all_filters = False
-                            break
-
-                if filter_item.operator == "equals":
-                    if metadata_value != filter_item.value:
-                        matches_all_filters = False
-                        break
-                elif filter_item.operator == "notEquals":
-                    if metadata_value == filter_item.value:
-                        matches_all_filters = False
-                        break
-                elif filter_item.operator == "greaterThan":
-                    if not metadata_value > filter_item.value:
-                        matches_all_filters = False
-                        break
-                elif filter_item.operator == "lessThan":
-                    if not metadata_value < filter_item.value:
-                        matches_all_filters = False
-                        break
-                elif filter_item.operator == "greaterThanOrEqual":
-                    if not metadata_value >= filter_item.value:
-                        matches_all_filters = False
-                        break
-                elif filter_item.operator == "lessThanOrEqual":
-                    if not metadata_value <= filter_item.value:
-                        matches_all_filters = False
-                        break
-
-            if matches_all_filters:
-                filtered_docs.append(doc)
-
-        return filtered_docs
+        return [
+            doc for doc in documents if all(passes_filter(doc, f) for f in filters)
+        ]
 
     def _extract_think_content(self, text: str) -> tuple[str, str, bool]:
         """Extract content from think tags and parse the bulleted response format."""
@@ -155,8 +134,21 @@ class ReagClient:
         return content, reasoning, is_irrelevant
 
     async def query(
+        self,
+        prompt: str,
+        documents: List[Document],
+        options: Optional[Dict] = None,
+        stream: bool = False,
+    ):
+        if stream:
+            return self._streaming_query(prompt, documents, options)
+        else:
+            return await self._batch_query(prompt, documents, options)
+
+    async def _batch_query(
         self, prompt: str, documents: List[Document], options: Optional[Dict] = None
     ) -> List[QueryResult]:
+        # Batch query logic remains the same
         try:
             # Convert dictionary filters to MetadataFilter objects
             filters = None
@@ -187,13 +179,12 @@ class ReagClient:
                 # Create tasks for parallel processing within the batch
                 for document in batch:
                     system = f"{self.system}\n\n# Available source\n\n{format_doc(document)}"
+                    history = self.memory.get_history()
+                    messages = [{"role": "system", "content": system}] + history + [{"role": "user", "content": prompt}]
                     tasks.append(
                         acompletion(
                             model=self.model,
-                            messages=[
-                                {"role": "system", "content": system},
-                                {"role": "user", "content": prompt},
-                            ],
+                            messages=messages,
                             response_format=self.schema,
                             **self.model_kwargs,
                         )
@@ -217,6 +208,8 @@ class ReagClient:
                                     document=document,
                                 )
                             )
+                            self.memory.add_message({"role": "user", "content": prompt})
+                            self.memory.add_message({"role": "assistant", "content": content})
                         else:
                             # Ensure it's parsed as a dict
                             data = (
@@ -228,9 +221,13 @@ class ReagClient:
                             if data["source"].get("is_irrelevant", True):
                                 continue
 
+                            content = data["source"].get("content", "")
+                            self.memory.add_message({"role": "user", "content": prompt})
+                            self.memory.add_message({"role": "assistant", "content": content})
+
                             results.append(
                                 QueryResult(
-                                    content=data["source"].get("content", ""),
+                                    content=content,
                                     reasoning=data["source"].get("reasoning", ""),
                                     is_irrelevant=data["source"].get("is_irrelevant", False),
                                     document=document,
@@ -244,3 +241,43 @@ class ReagClient:
 
         except Exception as e:
             raise Exception(f"Query failed: {str(e)}")
+
+    async def _streaming_query(
+        self, prompt: str, documents: List[Document], options: Optional[Dict] = None
+    ):
+        # Convert dictionary filters to MetadataFilter objects
+        filters = None
+        if options and "filter" in options:
+            raw_filters = options["filter"]
+            if isinstance(raw_filters, list):
+                filters = [
+                    MetadataFilter(**f) if isinstance(f, dict) else f
+                    for f in raw_filters
+                ]
+            elif isinstance(raw_filters, dict):
+                filters = [MetadataFilter(**raw_filters)]
+
+        filtered_documents = self._filter_documents_by_metadata(documents, filters)
+
+        def format_doc(doc: Document) -> str:
+            return f"Name: {doc.name}\nMetadata: {doc.metadata}\nContent: {doc.content}"
+
+        system = f"{self.system}\n\n# Available source\n\n{format_doc(filtered_documents[0])}"
+        history = self.memory.get_history()
+        messages = [{"role": "system", "content": system}] + history + [{"role": "user", "content": prompt}]
+
+        response_stream = await acompletion(
+            model=self.model,
+            messages=messages,
+            stream=True,
+            **self.model_kwargs,
+        )
+
+        full_response = ""
+        async for chunk in response_stream:
+            chunk_content = chunk.choices[0].delta.content or ""
+            full_response += chunk_content
+            yield StreamingQueryResult(content=chunk_content)
+
+        self.memory.add_message({"role": "user", "content": prompt})
+        self.memory.add_message({"role": "assistant", "content": full_response})
